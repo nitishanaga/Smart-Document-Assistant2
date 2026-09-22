@@ -1,0 +1,16 @@
+[theme]
+base = "dark"
+primaryColor = "#63e6c2"
+backgroundColor = "#0d171b"
+secondaryBackgroundColor = "#17252b"
+textColor = "#f5f1e8"
+linkColor = "#63e6c2"
+borderColor = "#33454b"
+font = "sans serif"
+baseRadius = "medium"
+buttonRadius = "medium"
+showWidgetBorder = true
+showSidebarBorder = true
+
+[server]
+maxUploadSize = 200
