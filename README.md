@@ -1,4 +1,4 @@
-# Smart Document Assistant
+<img width="2354" height="1824" alt="Gemini_Generated_Image_wy5479wy5479wy54 (1)" src="https://github.com/user-attachments/assets/d746ed9a-fe6e-41bc-9046-07e330bd7653" /># Smart Document Assistant
 
 A Streamlit document assistant that lets users upload documents, search them with natural-language questions, and receive grounded answers with source citations. It also provides summaries, visual mind maps, and study flashcards.
 
@@ -26,16 +26,7 @@ When the retrieved evidence is weak, the application refuses to invent an answer
 
 The application currently lives in `app.py` and runs as a direct Streamlit script.
 
-```mermaid
-flowchart TD
-    A[Edit code in project folder] --> B[git add .]
-    B --> C[Files staged for tracking]
-    C --> D[git commit -m 'message']
-    D --> E[Snapshot saved to local history]
-    E --> F[git push]
-    F --> G{Windows Native SSH Client}
-    G -->|Bypasses Application Control Policy| H[GitHub Remote Repository]
-```
+![System Architecture Diagram](Gemini_Generated_Image_wy5479wy5479wy54 (1))
 
 ### Data flow
 
