@@ -1,4 +1,4 @@
-# Smart Document Assistant
+<img width="2354" height="1824" alt="Gemini_Generated_Image_wy5479wy5479wy54 (1)" src="https://github.com/user-attachments/assets/d746ed9a-fe6e-41bc-9046-07e330bd7653" /># Smart Document Assistant
 
 A Streamlit document assistant that lets users upload documents, search them with natural-language questions, and receive grounded answers with source citations. It also provides summaries, visual mind maps, and study flashcards.
 
@@ -24,9 +24,23 @@ When the retrieved evidence is weak, the application refuses to invent an answer
 
 ## Architecture
 
-The application currently lives in `app.py` and runs as a direct Streamlit script. The updated system architecture is shown below.
+The application currently lives in `app.py` and runs as a direct Streamlit script.
 
-![Smart Document Assistant system architecture](Gemini_Generated_Image_wy5479wy5479wy54%20%281%29.png)
+```mermaid
+flowchart TD
+    A[Upload documents] --> B[Format-specific text extraction]
+    B --> C[Page, slide, sheet, and source metadata]
+    C --> D[Text chunks with paragraph ranges]
+    D --> E[HashingVectorizer embeddings]
+    E --> F[Normalized FAISS index]
+    G[User question] --> H[Groq query rewrite]
+    H --> I[FAISS and lexical hybrid retrieval]
+    I --> J[Numbered evidence excerpts]
+    J --> K[Groq grounded JSON answer]
+    K --> L[Validated citations and confidence]
+    L --> M[Answer, sources, debug evidence, and follow-ups]
+    C --> N[Groq summary, mind map, and flashcards]
+```
 
 ### Data flow
 
