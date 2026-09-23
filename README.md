@@ -1,4 +1,4 @@
-<img width="2354" height="1824" alt="Gemini_Generated_Image_wy5479wy5479wy54 (1)" src="https://github.com/user-attachments/assets/d746ed9a-fe6e-41bc-9046-07e330bd7653" /># Smart Document Assistant
+# Smart Document Assistant
 
 A Streamlit document assistant that lets users upload documents, search them with natural-language questions, and receive grounded answers with source citations. It also provides summaries, visual mind maps, and study flashcards.
 
@@ -24,42 +24,30 @@ When the retrieved evidence is weak, the application refuses to invent an answer
 
 ## Architecture
 
-The application currently lives in `app.py` and runs as a direct Streamlit script.
+The application currently lives in `app.py` and runs as a direct Streamlit script. Gemini Flash-Lite is the primary generation provider, Groq is the optional LLM fallback, and local extraction is the final fallback.
 
-```mermaid
-flowchart TD
-    A[Upload documents] --> B[Format-specific text extraction]
-    B --> C[Page, slide, sheet, and source metadata]
-    C --> D[Text chunks with paragraph ranges]
-    D --> E[HashingVectorizer embeddings]
-    E --> F[Normalized FAISS index]
-    G[User question] --> H[Groq query rewrite]
-    H --> I[FAISS and lexical hybrid retrieval]
-    I --> J[Numbered evidence excerpts]
-    J --> K[Groq grounded JSON answer]
-    K --> L[Validated citations and confidence]
-    L --> M[Answer, sources, debug evidence, and follow-ups]
-    C --> N[Groq summary, mind map, and flashcards]
-```
+![Smart Document Assistant system architecture](architecture.svg)
 
 ### Data flow
 
 1. The Streamlit frontend accepts one or more document uploads and user questions.
 2. Format-specific extractors read supported files and preserve page, slide, sheet, and source metadata.
 3. `split_text()` creates text chunks with paragraph ranges for traceable citations.
-4. `HashingVectorizer` creates deterministic local embeddings, which are normalized and stored in the FAISS index.
-5. Groq rewrites each user question before the retriever combines FAISS similarity with lexical term overlap.
+4. Deterministic local token-hash vectors are normalized and kept in memory for cosine-similarity search.
+5. The retriever combines vector similarity with lexical term overlap for differently worded questions and keeps coverage across documents.
 6. The retriever produces numbered evidence excerpts for the grounded answer request.
-7. Groq returns a JSON answer grounded only in those excerpts.
-8. The response parser validates citations, confidence, evidence, and follow-up questions before displaying them.
-9. Extracted document text can also be sent to Groq for summaries, mind maps, and flashcards.
+7. Gemini `gemini-3.5-flash-lite` receives the evidence and returns a grounded JSON answer.
+8. If Gemini is unavailable or rate-limited, Groq `llama-3.1-8b-instant` is tried automatically.
+9. If both providers fail, a local extractive answer uses the strongest retrieved sentences.
+10. The response parser validates citations, confidence, evidence, and follow-up questions before displaying them.
+11. Extracted document text can also be sent through the same provider fallback chain for summaries, mind maps, and flashcards.
 
 ## Technology Choices
 
 - **Streamlit:** Provides the interactive Python UI, upload controls, tabs, chat messages, forms, and session state with minimal application overhead.
-- **Groq:** Provides fast hosted chat completion for question rewriting, grounded answers, summaries, mind maps, flashcards, and query repair.
-- **FAISS:** Provides efficient similarity search over document chunks.
-- **scikit-learn `HashingVectorizer`:** Creates deterministic local retrieval vectors without requiring a separate embedding server or embedding API.
+- **Google AI Studio Gemini REST API:** Primary provider. `gemini-3.5-flash-lite` is selected by default for high-throughput, free-tier-friendly use; set `GEMINI_MODEL` to override it. The app uses Python's standard-library HTTP client, avoiding an SDK binary dependency.
+- **Groq REST API:** Optional LLM fallback when Gemini is unavailable or rate-limited. Configure `GROQ_API_KEY` and optionally `GROQ_MODEL` to enable it.
+- **Pure-Python retrieval:** Uses deterministic token hashing and cosine similarity without a separate embedding server or native numerical libraries.
 - **pypdf:** Extracts text and page numbers from PDFs.
 - **python-docx, openpyxl, xlrd:** Extract text from Word and Excel documents.
 - **Standard-library ZIP/XML parsing:** Extracts PowerPoint slide text without requiring the Pillow-dependent PowerPoint import at application startup.
@@ -79,25 +67,29 @@ python -m venv .venv
 ### 2. Install dependencies
 
 ```powershell
-python -m pip install streamlit groq faiss-cpu numpy pypdf scikit-learn python-docx python-pptx openpyxl xlrd beautifulsoup4
+python -m pip install -r requirements.txt
 ```
 
-The application avoids importing the Pillow-dependent PowerPoint package at startup, but `python-pptx` can remain installed for environments where it is useful.
+The application uses pure-Python retrieval and does not require NumPy, FAISS, scikit-learn, or an LLM SDK.
 
-### 3. Configure Groq
+### 3. Configure Google AI Studio
 
 Use an environment variable for a local session:
 
 ```powershell
+$env:GOOGLE_AI_STUDIO_KEY = "your-google-ai-studio-key"
+$env:GEMINI_MODEL = "gemini-3.5-flash-lite"
 $env:GROQ_API_KEY = "your-groq-api-key"
-$env:GROQ_MODEL = "openai/gpt-oss-20b"
+$env:GROQ_MODEL = "llama-3.1-8b-instant"
 ```
 
 Or create `.streamlit/secrets.toml`:
 
 ```toml
+GOOGLE_AI_STUDIO_KEY = "your-google-ai-studio-key"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 GROQ_API_KEY = "your-groq-api-key"
-GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_MODEL = "llama-3.1-8b-instant"
 ```
 
 The repository includes `.streamlit/secrets.toml.example` as a template. Copy it to `secrets.toml` and replace the placeholder locally.
@@ -113,10 +105,11 @@ The default local URL is `http://localhost:8501`.
 ## AI Tools Used
 
 - **GitHub Copilot / ChatGPT:** Assisted with implementation, debugging, UI iteration, retrieval design, citation validation, and documentation.
-- **Groq:** Used at runtime for query rewriting, grounded answer generation, summaries, query-repair suggestions, mind maps, flashcards, and follow-up questions.
-- **FAISS and local vectorization:** Used for retrieval; these are deterministic application components rather than generative AI services.
+- **Google AI Studio Gemini:** Used first at runtime for grounded answer generation, summaries, mind maps, flashcards, and follow-up questions.
+- **Groq:** Used as an optional runtime LLM fallback when Gemini fails or reaches its rate limit.
+- **Local token hashing and cosine similarity:** Used for retrieval and as the final answer fallback; these are deterministic application components rather than generative AI services.
 
-No Claude or Gemini API is required by the application.
+Claude is not required by the application. Groq is optional when Gemini is configured.
 
 ## Known Limitations
 
@@ -126,8 +119,9 @@ No Claude or Gemini API is required by the application.
 - Retrieval quality depends on extracted text quality and the local hashing vector representation.
 - Confidence and evidence scores are model-generated signals supported by retrieval similarity; they are not formal probabilities.
 - Conversation history and generated artifacts are stored in Streamlit session state and are not persistent across server restarts.
-- Groq model availability depends on the API key and current provider catalog. The app checks available models and supports `GROQ_MODEL` overrides.
-- Mind maps and flashcards are generated from document text, but their structure and phrasing still depend on the selected Groq model.
+- Gemini and Groq model availability depends on each provider's current catalog and account limits. The app supports `GEMINI_MODEL` and `GROQ_MODEL` overrides.
+- Free-tier RPM, TPM, and RPD limits vary by provider project and model; check each provider's dashboard before relying on a quota.
+- Mind maps and flashcards are generated from document text, but their structure and phrasing still depend on the selected Gemini model.
 - The application does not provide authentication or multi-user data isolation beyond Streamlit's runtime session behavior.
 
 ## Security and Secrets

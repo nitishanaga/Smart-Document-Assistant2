@@ -1,19 +1,18 @@
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import csv
 import io
+import urllib.error
+import urllib.request
 import zipfile
 import xml.etree.ElementTree as ElementTree
 
 import streamlit as st
-import faiss
-import numpy as np
 from pypdf import PdfReader
-from groq import Groq, NotFoundError
-from sklearn.feature_extraction.text import HashingVectorizer
 
 st.set_page_config(
     page_title="Smart Document Assistant",
@@ -94,8 +93,9 @@ st.session_state.setdefault("mindmaps", {})
 st.session_state.setdefault("flashcards", {})
 st.session_state.setdefault("library_fingerprint", None)
 st.session_state.setdefault("analysis", None)
-st.session_state.setdefault("groq_client", None)
-st.session_state.setdefault("groq_model", None)
+st.session_state.setdefault("ai_client", None)
+st.session_state.setdefault("ai_model", None)
+st.session_state.setdefault("gemini_unavailable", False)
 
 
 def render_source_chips(sources):
@@ -104,9 +104,9 @@ def render_source_chips(sources):
 
 
 def confidence_details(top_score, scores):
-    """Translate normalized FAISS similarity into simple user-facing signals."""
+    """Translate normalized cosine similarity into simple user-facing signals."""
     confidence = int(max(0, min(100, round(((top_score - 0.30) / 0.70) * 100))))
-    evidence_score = int(max(0, min(100, round(np.mean(scores) * 100))))
+    evidence_score = int(max(0, min(100, round(sum(scores) / len(scores) * 100)))) if scores else 0
     if confidence >= 75:
         label = "Strong match"
     elif confidence >= 45:
@@ -122,28 +122,53 @@ def meaningful_terms(text):
         "is", "it", "me", "of", "on", "the", "this", "to", "what", "which",
         "who", "why", "with", "you", "your",
     }
-    return {
-        term
-        for term in re.findall(r"[a-z0-9]+", text.lower())
-        if len(term) > 2 and term not in stop_words
+    irregular_forms = {
+        "caused": "cause",
+        "causes": "cause",
+        "offered": "offer",
+        "offers": "offer",
+        "travellers": "traveler",
     }
+    terms = set()
+    for term in re.findall(r"[a-z0-9]+", text.lower()):
+        if len(term) <= 2 or term in stop_words:
+            continue
+        term = irregular_forms.get(term, term)
+        if term.endswith("ies") and len(term) > 4:
+            term = term[:-3] + "y"
+        elif term.endswith("ing") and len(term) > 5:
+            term = term[:-3]
+        elif term.endswith("ed") and len(term) > 5:
+            term = term[:-2]
+        elif term.endswith("s") and not term.endswith("ss") and len(term) > 3:
+            term = term[:-1]
+        terms.add(term)
+    return terms
 
 
 def hybrid_retrieval(question, semantic_query, scores, positions):
-    """Combine FAISS similarity with generic term overlap for resilient retrieval."""
+    """Rank passages with both semantic similarity and exact term overlap."""
     query_terms = meaningful_terms(f"{question} {semantic_query}")
     candidates = []
-    for score, position in zip(scores[0], positions[0]):
+    for score, position in zip(scores, positions):
         if position >= 0:
-            candidates.append((float(score), position))
+            chunk_terms = meaningful_terms(st.session_state["chunks"][position]["text"])
+            overlap = (
+                len(query_terms & chunk_terms) / len(query_terms)
+                if query_terms else 0.0
+            )
+            combined_score = (float(score) * 0.7) + (overlap * 0.3)
+            candidates.append((combined_score, position))
 
     for position, chunk in enumerate(st.session_state["chunks"]):
         chunk_terms = meaningful_terms(chunk["text"])
         if not query_terms or not chunk_terms:
             continue
         overlap = len(query_terms & chunk_terms) / len(query_terms)
+        if query_terms and query_terms.issubset(chunk_terms):
+            overlap = min(1.0, overlap + 0.15)
         if overlap > 0:
-            candidates.append((max(0.20, overlap), position))
+            candidates.append((overlap * 0.3, position))
 
     best_by_position = {}
     for score, position in candidates:
@@ -152,12 +177,28 @@ def hybrid_retrieval(question, semantic_query, scores, positions):
     document_limit = max(1, len(get_document_names()))
     selected = []
     document_counts = {}
+    selected_positions = set()
+
+    # Keep at least one strongest passage from every uploaded document so
+    # cross-document questions have evidence from each relevant source.
     for position, score in ranked:
         chunk = st.session_state["chunks"][position]
         document = document_name_from_source(chunk["source"])
-        if document_counts.get(document, 0) >= 2:
+        if document in document_counts:
             continue
         selected.append((position, score))
+        selected_positions.add(position)
+        document_counts[document] = 1
+
+    for position, score in ranked:
+        if position in selected_positions:
+            continue
+        chunk = st.session_state["chunks"][position]
+        document = document_name_from_source(chunk["source"])
+        if document_counts.get(document, 0) >= 3:
+            continue
+        selected.append((position, score))
+        selected_positions.add(position)
         document_counts[document] = document_counts.get(document, 0) + 1
         if len(selected) >= max(6, document_limit * 2):
             break
@@ -165,6 +206,28 @@ def hybrid_retrieval(question, semantic_query, scores, positions):
         {"chunk": st.session_state["chunks"][position], "score": float(score)}
         for position, score in selected
     ]
+
+
+def expand_retrieved_context(retrieved, max_items=12):
+    """Add nearby chunks so answers can use context split across boundaries."""
+    chunks = st.session_state["chunks"]
+    selected_positions = {
+        index
+        for index, chunk in enumerate(chunks)
+        if any(chunk is item["chunk"] for item in retrieved)
+    }
+    for item in list(retrieved):
+        position = chunks.index(item["chunk"])
+        for neighbor in (position - 1, position + 1):
+            if 0 <= neighbor < len(chunks):
+                same_document = document_name_from_source(chunks[neighbor]["source"]) == document_name_from_source(item["chunk"]["source"])
+                if same_document:
+                    selected_positions.add(neighbor)
+    expanded = list(retrieved)
+    for position in sorted(selected_positions):
+        if not any(item["chunk"] is chunks[position] for item in expanded):
+            expanded.append({"chunk": chunks[position], "score": 0.21})
+    return expanded[:max_items]
 
 
 def recent_memory():
@@ -277,72 +340,140 @@ def make_library_fingerprint(uploaded_files):
     return digest.hexdigest() if uploaded_files else None
 
 
-def get_groq_client():
-    """Create the Groq client from Streamlit secrets or the environment."""
-    api_key = os.getenv("GROQ_API_KEY")
+def get_ai_client():
+    """Load the Google AI Studio key without importing an SDK."""
+    api_key = os.getenv("GOOGLE_AI_STUDIO_KEY")
     if not api_key:
         try:
-            api_key = st.secrets["GROQ_API_KEY"]
+            api_key = st.secrets["GOOGLE_AI_STUDIO_KEY"]
         except (KeyError, FileNotFoundError):
             api_key = None
     if not api_key:
         raise RuntimeError(
-            "GROQ_API_KEY is not configured. Add it to .streamlit/secrets.toml "
-            "or set the GROQ_API_KEY environment variable, then restart Streamlit."
+            "GOOGLE_AI_STUDIO_KEY is not configured. Add it to "
+            ".streamlit/secrets.toml or set the environment variable, then restart Streamlit."
         )
-    if st.session_state["groq_client"] is None:
-        st.session_state["groq_client"] = Groq(api_key=api_key)
-    return st.session_state["groq_client"]
+    if st.session_state["ai_client"] != api_key:
+        st.session_state["ai_client"] = api_key
+    return st.session_state["ai_client"]
 
 
-def get_groq_model(force_refresh=False):
-    """Choose a chat model available to the current Groq API key."""
-    if force_refresh:
-        st.session_state["groq_model"] = None
-    if st.session_state["groq_model"]:
-        return st.session_state["groq_model"]
-
-    preferred_models = [
-        "openai/gpt-oss-20b",
-        "openai/gpt-oss-120b",
-        "qwen/qwen3.8-27b",
-    ]
-    client = get_groq_client()
+def gemini_request(model, payload):
+    """Call Google AI Studio's Gemini REST API using the standard library."""
+    api_key = get_ai_client()
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+    }
+    request = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
     try:
-        available_models = {model.id for model in client.models.list().data}
-    except Exception:
-        available_models = set()
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        if error.code == 429:
+            raise RuntimeError("Gemini is rate-limiting requests (HTTP 429). Wait a moment and try again.") from error
+        raise RuntimeError(
+            f"Google AI Studio request failed with HTTP {error.code}. "
+            "Check GOOGLE_AI_STUDIO_KEY and GEMINI_MODEL."
+        ) from error
+    except urllib.error.URLError as error:
+        raise RuntimeError("Could not connect to Google AI Studio. Check the network connection.") from error
 
-    configured_model = os.getenv("GROQ_MODEL")
+
+def get_ai_model(force_refresh=False):
+    """Choose the configured Gemini model."""
+    if force_refresh:
+        st.session_state["ai_model"] = None
+    if st.session_state["ai_model"]:
+        return st.session_state["ai_model"]
+    configured_model = os.getenv("GEMINI_MODEL")
     if not configured_model:
         try:
-            configured_model = st.secrets.get("GROQ_MODEL")
+            configured_model = st.secrets.get("GEMINI_MODEL")
         except (KeyError, FileNotFoundError):
             configured_model = None
+    st.session_state["ai_model"] = configured_model or "gemini-3.5-flash-lite"
+    return st.session_state["ai_model"]
 
-    candidates = ([configured_model] if configured_model else []) + preferred_models
-    for model in candidates:
-        if model and (not available_models or model in available_models):
-            st.session_state["groq_model"] = model
-            return model
 
-    raise RuntimeError("No supported Groq chat model is available for this API key.")
+def get_groq_key():
+    """Load an optional Groq fallback key without requiring it."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets.get("GROQ_API_KEY")
+        except (KeyError, FileNotFoundError):
+            api_key = None
+    return api_key
+
+
+def groq_fallback_request(messages, json_mode=False):
+    """Call Groq only when Gemini is unavailable and a fallback key exists."""
+    api_key = get_groq_key()
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is not configured for fallback use.")
+    model = os.getenv("GROQ_MODEL")
+    if not model:
+        try:
+            model = st.secrets.get("GROQ_MODEL")
+        except (KeyError, FileNotFoundError):
+            model = None
+    payload = {"model": model or "openai/gpt-oss-20b", "messages": messages}
+    request = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "smart-document-assistant/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        return result["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"Groq fallback failed with HTTP {error.code}.") from error
+    except (urllib.error.URLError, KeyError, IndexError, TypeError, ValueError) as error:
+        raise RuntimeError("Groq fallback could not return an answer.") from error
 
 
 def groq_chat(messages, json_mode=False):
-    """Call Groq with a chat model available to the current account."""
-    request = {
-        "model": get_groq_model(),
-        "messages": messages,
-    }
+    """Use Gemini first, then Groq, while preserving existing call sites."""
+    system_parts = [item["content"] for item in messages if item.get("role") == "system"]
+    contents = [
+        {"role": "user", "parts": [{"text": item["content"]}]}
+        for item in messages
+        if item.get("role") != "system"
+    ]
+    payload = {"contents": contents}
+    if system_parts:
+        payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
     if json_mode:
-        request["response_format"] = {"type": "json_object"}
+        payload["generationConfig"] = {"responseMimeType": "application/json"}
+    gemini_error = None
+    if not st.session_state["gemini_unavailable"]:
+        try:
+            response = gemini_request(get_ai_model(), payload)
+            return response["candidates"][0]["content"]["parts"][0]["text"]
+        except (RuntimeError, KeyError, IndexError, TypeError) as error:
+            gemini_error = error
+            if "rate-limiting" in str(error) or "quota" in str(error).lower():
+                st.session_state["gemini_unavailable"] = True
+    if gemini_error is None:
+        gemini_error = RuntimeError("Gemini is unavailable for this session.")
     try:
-        response = get_groq_client().chat.completions.create(**request)
-    except NotFoundError:
-        request["model"] = get_groq_model(force_refresh=True)
-        response = get_groq_client().chat.completions.create(**request)
-    return response.choices[0].message.content
+        return groq_fallback_request(messages, json_mode=json_mode)
+    except RuntimeError as groq_error:
+        raise RuntimeError(
+            f"Gemini unavailable ({gemini_error}); Groq fallback unavailable ({groq_error})."
+        ) from gemini_error
 
 
 def generate_document_suggestions():
@@ -385,27 +516,8 @@ def generate_document_suggestions():
 
 
 def analyze_question(question):
-    """Extract a semantic search phrase while preserving the user's intent."""
-    try:
-        content = groq_chat(
-            [
-                {
-                    "role": "system",
-                    "content": "Rewrite the user's question into a concise semantic search query. Resolve references using the earlier context when possible. Return JSON as {\"search_query\": \"...\"}.",
-                },
-                {
-                    "role": "user",
-                    "content": f"Earlier context:\n{recent_memory() or 'None'}\n\nQuestion:\n{question}",
-                },
-            ],
-            json_mode=True,
-        )
-        search_query = json.loads(content)["search_query"]
-        if isinstance(search_query, str) and search_query.strip():
-            return search_query.strip()
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
-        pass
-    return question
+    """Use the user's wording locally to avoid an extra API request per question."""
+    return question.strip()
 
 
 def build_library(uploaded_files):
@@ -416,10 +528,7 @@ def build_library(uploaded_files):
     if not all_chunks:
         return None
     embeddings = make_embeddings([chunk["text"] for chunk in all_chunks])
-    faiss.normalize_L2(embeddings)
-    index = faiss.IndexFlatIP(embeddings.shape[1])
-    index.add(embeddings)
-    return all_chunks, index
+    return all_chunks, embeddings
 
 
 def create_summary(document_name):
@@ -463,21 +572,50 @@ def create_mindmap(document_name):
         ],
         json_mode=True,
     )
-    parsed = json.loads(content)
+    cleaned_content = content.strip()
+    if cleaned_content.startswith("```"):
+        cleaned_content = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned_content, flags=re.IGNORECASE)
+    parsed = json.loads(cleaned_content)
     branches = parsed.get("branches", [])
     if not isinstance(branches, list):
         raise ValueError("Mind map response did not contain branches.")
+    normalized_branches = []
+    for branch in branches:
+        if not isinstance(branch, dict) or not branch.get("label"):
+            continue
+        details = branch.get("details", [])
+        if isinstance(details, str):
+            details = [details]
+        normalized_branches.append(
+            {
+                "label": str(branch["label"]),
+                "details": [
+                    str(detail.get("text", detail)) if isinstance(detail, dict) else str(detail)
+                    for detail in details
+                    if str(detail.get("text", detail) if isinstance(detail, dict) else detail).strip()
+                ],
+            }
+        )
     return {
         "title": str(parsed.get("title", document_name)),
-        "branches": [
-            {
-                "label": str(branch.get("label", "")),
-                "details": [str(detail) for detail in branch.get("details", [])],
-            }
-            for branch in branches
-            if isinstance(branch, dict) and branch.get("label")
-        ],
+        "branches": normalized_branches,
     }
+
+
+def local_mindmap(document_name):
+    """Build a useful fallback map from the selected document's text."""
+    chunks = [
+        chunk["text"].strip()
+        for chunk in st.session_state["chunks"]
+        if document_name_from_source(chunk["source"]) == document_name
+    ]
+    text = " ".join(chunks)
+    sentences = [item.strip() for item in re.split(r"(?<=[.!?])\s+", text) if item.strip()]
+    branches = [
+        {"label": f"Section {number}", "details": [sentence[:240]]}
+        for number, sentence in enumerate(sentences[:8], start=1)
+    ]
+    return {"title": document_name, "branches": branches}
 
 
 def create_flashcards(document_name):
@@ -637,13 +775,30 @@ def split_text(text, source, chunk_size=800, overlap=150):
 
 def make_embeddings(texts):
     """Create deterministic local retrieval vectors without a model server."""
-    vectorizer = HashingVectorizer(
-        n_features=384,
-        alternate_sign=False,
-        norm=None,
-        stop_words="english",
-    )
-    return vectorizer.transform(texts).toarray().astype("float32")
+    dimensions = 384
+    embeddings = []
+    for text in texts:
+        vector = [0.0] * dimensions
+        for term in meaningful_terms(text):
+            digest = hashlib.sha256(term.encode("utf-8")).digest()
+            position = int.from_bytes(digest[:4], "little") % dimensions
+            vector[position] += 1.0
+        magnitude = math.sqrt(sum(value * value for value in vector))
+        embeddings.append(
+            [value / magnitude for value in vector] if magnitude else vector
+        )
+    return embeddings
+
+
+def ranked_embedding_matches(query_embedding, embeddings, limit):
+    """Return the highest cosine-similarity document vectors."""
+    ranked = []
+    for position, embedding in enumerate(embeddings):
+        score = sum(left * right for left, right in zip(query_embedding, embedding))
+        ranked.append((score, position))
+    ranked.sort(reverse=True)
+    selected = ranked[:limit]
+    return [score for score, _ in selected], [position for _, position in selected]
 
 
 def parse_answer_response(content, retrieved):
@@ -656,6 +811,26 @@ def parse_answer_response(content, retrieved):
         cited_ids = [int(item) for item in cited_ids if str(item).isdigit()]
         cited_ids = [item for item in cited_ids if 1 <= item <= len(retrieved)]
         answer = str(parsed.get("answer", "")).strip()
+        citation_text = parsed.get(
+            "citation",
+            parsed.get("citations", parsed.get("source", parsed.get("source_id", ""))),
+        )
+        if not cited_ids and citation_text:
+            if isinstance(citation_text, list):
+                cited_ids = [
+                    int(item.get("source_id", item.get("id")))
+                    for item in citation_text
+                    if isinstance(item, dict) and str(item.get("source_id", item.get("id", ""))).isdigit()
+                ]
+                cited_ids.extend(int(item) for item in citation_text if str(item).isdigit())
+            else:
+                cited_ids = [
+                    int(marker)
+                    for marker in re.findall(r"\[(\d+)\]", str(citation_text))
+                ]
+            cited_ids = [item for item in cited_ids if 1 <= item <= len(retrieved)]
+        if cited_ids and not re.search(r"\[\d+\]", answer):
+            answer = f"{answer} [{cited_ids[0]}]"
         cited_markers = {
             int(marker)
             for marker in re.findall(r"\[(\d+)\]", answer)
@@ -691,6 +866,41 @@ def parse_answer_response(content, retrieved):
             "evidence_summary": "Evidence is based on the retrieved excerpts shown below.",
             "follow_up_questions": [],
         }
+
+
+def local_extractive_answer(question, retrieved):
+    """Answer from the strongest retrieved sentences when Groq is unavailable."""
+    query_terms = meaningful_terms(question)
+    candidates = []
+    for source_id, item in enumerate(retrieved, start=1):
+        sentences = re.split(r"(?<=[.!?])\s+|\n+", item["chunk"]["text"].strip())
+        for sentence in sentences:
+            cleaned = sentence.strip()
+            if not cleaned:
+                continue
+            sentence_terms = meaningful_terms(cleaned)
+            overlap = (
+                len(query_terms & sentence_terms) / len(query_terms)
+                if query_terms else 0.0
+            )
+            candidates.append((overlap, item["score"], source_id, cleaned))
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    useful = [item for item in candidates if item[0] > 0]
+    if not useful:
+        return None
+    selected = useful[:2]
+    answer = " ".join(f"{item[3]} [{item[2]}]" for item in selected)
+    cited_ids = sorted({item[2] for item in selected})
+    evidence_score = int(max(25, min(100, round(selected[0][0] * 100))))
+    return {
+        "answer": answer,
+        "cited_source_ids": cited_ids,
+        "confidence_score": evidence_score,
+        "evidence_score": evidence_score,
+        "confidence_reason": "Answer extracted directly from matching document sentences.",
+        "evidence_summary": "The answer is based on the retrieved document text.",
+        "follow_up_questions": [],
+    }
 
 
 def render_answer_details(result):
@@ -756,6 +966,8 @@ def render_conversation():
                     st.markdown(result["answer"])
                 else:
                     st.info("I could not find this information in the uploaded documents.")
+                if result.get("answer_source"):
+                    st.caption(f"Answer source: {result['answer_source']}")
                 if "confidence" in result:
                     render_answer_details(result)
                 else:
@@ -792,8 +1004,8 @@ with st.sidebar:
                     st.error("Try a text-based PDF or a UTF-8 TXT file.")
                 else:
                     st.session_state["chunks"], st.session_state["index"] = library
-                    st.write("Creating document-specific suggestions")
-                    st.session_state["analysis"] = generate_document_suggestions()
+                    st.write("Creating local document suggestions")
+                    st.session_state["analysis"] = fallback_suggestions()
                     status.update(label="Document ready", state="complete", expanded=False)
                     st.toast("Your document is ready to explore", icon=":material/check:")
 
@@ -901,18 +1113,20 @@ with ask_tab:
             with st.spinner("Generating your answer...", show_time=True):
                 semantic_query = analyze_question(question)
                 query_embedding = make_embeddings([semantic_query])
-                faiss.normalize_L2(query_embedding)
-                scores, positions = st.session_state["index"].search(
-                    query_embedding,
-                    k=min(
+                scores, positions = ranked_embedding_matches(
+                    query_embedding[0],
+                    st.session_state["index"],
+                    min(
                         len(st.session_state["chunks"]),
                         max(6, len(get_document_names()) * 3),
                     ),
                 )
-                retrieved = hybrid_retrieval(question, semantic_query, scores, positions)
+                retrieved = expand_retrieved_context(
+                    hybrid_retrieval(question, semantic_query, scores, positions)
+                )
                 matches = [item["chunk"] for item in retrieved]
 
-                if not retrieved or retrieved[0]["score"] < 0.20:
+                if not retrieved:
                     st.warning(
                         "I could not find this information in the uploaded documents."
                     )
@@ -946,7 +1160,7 @@ or a clear equivalent phrase.
 If the answer is truly absent from the retrieved text, respond exactly:
 "I could not find this information in the uploaded documents."
 
-Give a detailed, well-explained answer. Break complex answers into clear paragraphs or bullet points when useful.
+Answer precisely and concisely. Use only facts explicitly stated in the retrieved excerpts or direct, unavoidable inferences. Do not fill gaps with general knowledge, guesses, or details from memory. If the excerpts conflict or do not answer the exact question, say so instead of choosing a likely answer. Break complex answers into clear paragraphs or bullet points when useful.
 Every factual claim must be supported by one or more retrieved source IDs such as [1] or [2].
 When the question compares or asks about multiple documents, use evidence from each relevant document and identify each source clearly. Do not treat one document as evidence for another.
 Put the matching source ID immediately after the supported claim, for example [1]. Only cite source IDs that appear in the retrieved evidence. The source panel will show the exact document excerpt and its page, slide, or sheet when available.
@@ -974,7 +1188,7 @@ Retrieved document text:
 """
                     confidence, evidence_score, confidence_label = confidence_details(
                         retrieved[0]["score"],
-                        np.array([item["score"] for item in retrieved], dtype="float32"),
+                        [item["score"] for item in retrieved],
                     )
                     try:
                         content = groq_chat(
@@ -988,14 +1202,12 @@ Retrieved document text:
                             json_mode=True,
                         )
                         generated = parse_answer_response(content, retrieved)
+                        generated["answer_source"] = "Gemini or Groq LLM"
                         recovery_suggestions = []
-                        if generated["confidence_score"] < 40 or not generated["cited_source_ids"]:
-                            recovery_suggestions = generate_query_repair_suggestions(question)
-                            generated["answer"] = "I could not find this information in the uploaded documents."
-                            generated["cited_source_ids"] = []
-                            generated["evidence_score"] = 0
-                            generated["confidence_reason"] = "The retrieved evidence was not strong enough to support a reliable answer."
-                            generated["evidence_summary"] = "No answer-grounded evidence met the 40% confidence threshold."
+                        if not generated["cited_source_ids"]:
+                            generated = local_extractive_answer(question, retrieved) or generated
+                            generated["answer_source"] = "Local document fallback"
+                            recovery_suggestions = fallback_suggestions()
                         fresh_questions = fresh_follow_up_questions(
                             generated["follow_up_questions"],
                             question,
@@ -1012,16 +1224,17 @@ Retrieved document text:
                         generated["follow_up_questions"] = fresh_questions[:3]
                         generated["recovery_suggestions"] = recovery_suggestions
                     except RuntimeError as error:
-                        generated = {
+                        generated = local_extractive_answer(question, retrieved) or {
                             "answer": str(error),
                             "cited_source_ids": [],
                             "confidence_score": 0,
                             "evidence_score": 0,
-                            "confidence_reason": "The answer could not be generated because Groq is not configured.",
-                            "evidence_summary": "No answer-grounded evidence is available until Groq is configured.",
+                            "confidence_reason": "The answer could not be generated from the document.",
+                            "evidence_summary": "No matching document sentence was found.",
                             "follow_up_questions": [],
-                            "recovery_suggestions": [],
                         }
+                        generated["answer_source"] = "Local document fallback"
+                        generated["recovery_suggestions"] = fallback_suggestions()
                     cited_matches = [
                         retrieved[source_id - 1]["chunk"]
                         for source_id in generated["cited_source_ids"]
@@ -1038,6 +1251,7 @@ Retrieved document text:
                         "evidence_summary": generated["evidence_summary"],
                         "follow_up_questions": generated["follow_up_questions"],
                         "recovery_suggestions": generated.get("recovery_suggestions", []),
+                        "answer_source": generated.get("answer_source", "Gemini or Groq LLM"),
                         "retrieved": retrieved,
                         "confidence_label": (
                             "Strong support" if generated["confidence_score"] >= 75
@@ -1087,9 +1301,9 @@ with mindmap_tab:
                     st.session_state["mindmaps"][selected_document] = create_mindmap(selected_document)
                     status.update(label="Mind map ready", state="complete")
                 except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
-                    st.session_state["mindmaps"][selected_document] = None
-                    status.update(label="Mind map unavailable", state="error")
-                    st.warning(str(error), icon=":material/key_off:")
+                    st.session_state["mindmaps"][selected_document] = local_mindmap(selected_document)
+                    status.update(label="Mind map ready from document text", state="complete")
+                    st.info("The AI provider was unavailable, so this map was built directly from the selected document.", icon=":material/info:")
         mindmap = st.session_state["mindmaps"][selected_document]
         if mindmap:
             root = html.escape(mindmap["title"])
