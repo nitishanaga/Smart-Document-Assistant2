@@ -24,35 +24,21 @@ When the retrieved evidence is weak, the application refuses to invent an answer
 
 ## Architecture
 
-The application currently lives in `app.py` and runs as a direct Streamlit script.
+The application currently lives in `app.py` and runs as a direct Streamlit script. The updated system architecture is shown below.
 
-```mermaid
-flowchart TD
-    A[Upload documents] --> B[Format-specific text extraction]
-    B --> C[Page, slide, sheet, and source metadata]
-    C --> D[Text chunks with paragraph ranges]
-    D --> E[HashingVectorizer embeddings]
-    E --> F[Normalized FAISS index]
-    G[User question] --> H[Groq query rewrite]
-    H --> I[FAISS and lexical hybrid retrieval]
-    I --> J[Numbered evidence excerpts]
-    J --> K[Groq grounded JSON answer]
-    K --> L[Validated citations and confidence]
-    L --> M[Answer, sources, debug evidence, and follow-ups]
-    C --> N[Groq summary, mind map, and flashcards]
-```
+![Smart Document Assistant system architecture](Gemini_Generated_Image_wy5479wy5479wy54%20%281%29.png)
 
 ### Data flow
 
-1. Streamlit accepts one or more files.
-2. `read_uploaded_file()` extracts readable text and preserves source metadata.
-3. `split_text()` creates overlapping chunks and records paragraph ranges.
-4. `HashingVectorizer` creates deterministic local vectors.
-5. FAISS indexes normalized vectors for similarity search.
-6. A hybrid retriever combines vector similarity with meaningful-term overlap.
-7. Groq rewrites the question and generates a JSON answer from numbered excerpts only.
-8. The response parser validates citations, confidence, evidence, and follow-up questions.
-9. The UI displays the answer and the exact cited excerpts.
+1. The Streamlit frontend accepts one or more document uploads and user questions.
+2. Format-specific extractors read supported files and preserve page, slide, sheet, and source metadata.
+3. `split_text()` creates text chunks with paragraph ranges for traceable citations.
+4. `HashingVectorizer` creates deterministic local embeddings, which are normalized and stored in the FAISS index.
+5. Groq rewrites each user question before the retriever combines FAISS similarity with lexical term overlap.
+6. The retriever produces numbered evidence excerpts for the grounded answer request.
+7. Groq returns a JSON answer grounded only in those excerpts.
+8. The response parser validates citations, confidence, evidence, and follow-up questions before displaying them.
+9. Extracted document text can also be sent to Groq for summaries, mind maps, and flashcards.
 
 ## Technology Choices
 
