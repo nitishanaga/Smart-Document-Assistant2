@@ -28,18 +28,13 @@ The application currently lives in `app.py` and runs as a direct Streamlit scrip
 
 ```mermaid
 flowchart TD
-    A[Upload documents] --> B[Format-specific text extraction]
-    B --> C[Page, slide, sheet, and source metadata]
-    C --> D[Text chunks with paragraph ranges]
-    D --> E[HashingVectorizer embeddings]
-    E --> F[Normalized FAISS index]
-    G[User question] --> H[Groq query rewrite]
-    H --> I[FAISS and lexical hybrid retrieval]
-    I --> J[Numbered evidence excerpts]
-    J --> K[Groq grounded JSON answer]
-    K --> L[Validated citations and confidence]
-    L --> M[Answer, sources, debug evidence, and follow-ups]
-    C --> N[Groq summary, mind map, and flashcards]
+    A[Edit code in project folder] --> B[git add .]
+    B --> C[Files staged for tracking]
+    C --> D[git commit -m 'message']
+    D --> E[Snapshot saved to local history]
+    E --> F[git push]
+    F --> G{Windows Native SSH Client}
+    G -->|Bypasses Application Control Policy| H[GitHub Remote Repository]
 ```
 
 ### Data flow
